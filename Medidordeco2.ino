@@ -13,7 +13,7 @@ IPAddress apSubnet(255, 255, 255, 0);
 // ===== PINES =====
 #define MQ135_PIN 34
 #define LED_VERDE 25
-#define LED_AMARILLO 26
+#define LED_AZUL 26
 #define LED_ROJO 27
 
 // ===== OBJETOS =====
@@ -29,12 +29,24 @@ struct TramoICA {
 };
 
 int lecturaBase = 0;
+bool calibracionValida = false;
+String diagnosticoSensor = "Esperando calibracion";
 unsigned long ultimaActualizacionLCD = 0;
 const unsigned long INTERVALO_LCD_MS = 1500;
-const int RAW_REFERENCIA_ALTA = 3200;
+const int RAW_DELTA_GAS_MAX = 1200;
 const int GAS_ESTIMADO_MAX = 3000;
 const int ADC_SATURADO = 4090;
 const int MARGEN_SATURACION = 60;
+const int ADC_MINIMO_VALIDO = 20;
+const int UMBRAL_LED_VERDE_MAX = 166;
+const int UMBRAL_LED_AZUL_MAX = 334;
+const unsigned long PRECALENTAMIENTO_MINIMO_MS = 2UL * 60UL * 1000UL;
+const unsigned long PRECALENTAMIENTO_RECOMENDADO_MS = 5UL * 60UL * 1000UL;
+const unsigned long PRECALENTAMIENTO_IDEAL_MS = 10UL * 60UL * 1000UL;
+const int DELTA_ESTABLE_MAX = 15;
+const int LECTURAS_ESTABLES_NECESARIAS = 60;
+const unsigned long INTERVALO_ESTABILIDAD_MS = 500;
+const unsigned long TIEMPO_MAX_ESTABILIZACION_MS = PRECALENTAMIENTO_IDEAL_MS;
 
 const TramoICA TRAMOS_ICA[] = {
   {0, 350, 0, 50, "BUENA"},
@@ -58,12 +70,102 @@ bool lecturaSaturada(int valorADC) {
   return valorADC >= (ADC_SATURADO - MARGEN_SATURACION);
 }
 
+bool lecturaMuyBaja(int valorADC) {
+  return valorADC <= ADC_MINIMO_VALIDO;
+}
+
+String minutosRedondeados(unsigned long milisegundos) {
+  unsigned long minutos = (milisegundos + 59999UL) / 60000UL;
+  return String(minutos) + " min";
+}
+
+bool esperarEstabilizacionSensor() {
+  Serial.println("Estabilizando MQ135 antes de tomar lecturaBase...");
+  Serial.println("Metodo: comparar lecturas consecutivas hasta que el cambio sea pequeno durante un rato.");
+  Serial.print("Minimo absoluto: ");
+  Serial.println(minutosRedondeados(PRECALENTAMIENTO_MINIMO_MS));
+  Serial.print("Recomendado: ");
+  Serial.println(minutosRedondeados(PRECALENTAMIENTO_RECOMENDADO_MS));
+  Serial.print("Ideal: ");
+  Serial.println(minutosRedondeados(PRECALENTAMIENTO_IDEAL_MS));
+  Serial.print("Delta estable maximo: ");
+  Serial.println(DELTA_ESTABLE_MAX);
+
+  unsigned long inicio = millis();
+  int lecturaAnterior = leerPromedioSensor(4, 10);
+  int lecturasEstables = 0;
+
+  while (millis() - inicio < TIEMPO_MAX_ESTABILIZACION_MS) {
+    int lecturaActual = leerPromedioSensor(4, 10);
+    int diferencia = abs(lecturaActual - lecturaAnterior);
+
+    if (!lecturaSaturada(lecturaActual) && !lecturaMuyBaja(lecturaActual) && diferencia <= DELTA_ESTABLE_MAX) {
+      lecturasEstables++;
+    } else {
+      lecturasEstables = 0;
+    }
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Estabilizando");
+    lcd.setCursor(0, 1);
+    lcd.print("Est ");
+    lcd.print(lecturasEstables);
+    lcd.print("/");
+    lcd.print(LECTURAS_ESTABLES_NECESARIAS);
+
+    Serial.print("RAW=");
+    Serial.print(lecturaActual);
+    Serial.print(" DIF=");
+    Serial.print(diferencia);
+    Serial.print(" ESTABLES=");
+    Serial.println(lecturasEstables);
+
+    if (lecturasEstables >= LECTURAS_ESTABLES_NECESARIAS) {
+      diagnosticoSensor = "Sensor estable. Base automatica tomada cuando la variacion RAW se mantuvo pequena.";
+      return true;
+    }
+
+    lecturaAnterior = lecturaActual;
+    delay(INTERVALO_ESTABILIDAD_MS);
+  }
+
+  diagnosticoSensor = "No se logro estabilidad antes del tiempo maximo. Revisar sensor, alimentacion, GND y salida analogica.";
+  return false;
+}
+
+bool calibrarLecturaBase() {
+  lecturaBase = leerPromedioSensor(40, 50);
+
+  if (lecturaSaturada(lecturaBase)) {
+    diagnosticoSensor = "Calibracion invalida: lecturaBase esta saturada. Revisar AO > 3.3V, divisor de voltaje, GND comun y precalentamiento.";
+    return false;
+  }
+
+  if (lecturaMuyBaja(lecturaBase)) {
+    diagnosticoSensor = "Calibracion invalida: lecturaBase esta casi en 0. Revisar cable AO, GND, alimentacion del modulo y pin GPIO 34.";
+    return false;
+  }
+
+  diagnosticoSensor = "Base automatica valida. El ICA se calcula con el aumento RAW respecto a lecturaBase.";
+  return true;
+}
+
 int convertirRawAGasEstimado(int valorADC) {
   if (lecturaSaturada(valorADC)) {
     return GAS_ESTIMADO_MAX;
   }
-  int rawMax = max(lecturaBase + 400, RAW_REFERENCIA_ALTA);
-  long gasEstimado = map(valorADC, lecturaBase, rawMax, 0, GAS_ESTIMADO_MAX);
+
+  if (!calibracionValida) {
+    return 0;
+  }
+
+  int deltaADC = valorADC - lecturaBase;
+  if (deltaADC <= 0) {
+    return 0;
+  }
+
+  long gasEstimado = map(deltaADC, 0, RAW_DELTA_GAS_MAX, 0, GAS_ESTIMADO_MAX);
   return constrain(static_cast<int>(gasEstimado), 0, GAS_ESTIMADO_MAX);
 }
 
@@ -91,13 +193,31 @@ String obtenerEstadoICA(int ica) {
   return "PELIGROSA";
 }
 
+String colorDesdeRGB(int rojo, int verde, int azul) {
+  char color[8];
+  snprintf(color, sizeof(color), "#%02X%02X%02X", rojo, verde, azul);
+  return String(color);
+}
+
+int interpolarCanal(int inicio, int fin, int valor, int valorMaximo) {
+  return inicio + ((fin - inicio) * valor) / valorMaximo;
+}
+
 String obtenerColorICA(int ica) {
-  if (ica <= 50) return "#2dc653";
-  if (ica <= 100) return "#f4b400";
-  if (ica <= 150) return "#fb8500";
-  if (ica <= 200) return "#e63946";
-  if (ica <= 300) return "#7b2cbf";
-  return "#6a040f";
+  int valor = constrain(ica, 0, 500);
+
+  if (valor <= 250) {
+    int rojo = interpolarCanal(45, 2, valor, 250);
+    int verde = interpolarCanal(198, 132, valor, 250);
+    int azul = interpolarCanal(83, 199, valor, 250);
+    return colorDesdeRGB(rojo, verde, azul);
+  }
+
+  int tramo = valor - 250;
+  int rojo = interpolarCanal(2, 230, tramo, 250);
+  int verde = interpolarCanal(132, 57, tramo, 250);
+  int azul = interpolarCanal(199, 70, tramo, 250);
+  return colorDesdeRGB(rojo, verde, azul);
 }
 
 String obtenerRecomendacionICA(int ica) {
@@ -114,19 +234,19 @@ int calcularPorcentajeICA(int ica) {
   return constrain(static_cast<int>(porcentaje), 0, 100);
 }
 
+void encenderLedICA(bool verde, bool azul, bool rojo) {
+  digitalWrite(LED_VERDE, verde ? HIGH : LOW);
+  digitalWrite(LED_AZUL, azul ? HIGH : LOW);
+  digitalWrite(LED_ROJO, rojo ? HIGH : LOW);
+}
+
 void actualizarSalidas(int ica, const String& estadoICA) {
-  if (ica <= 50) {
-    digitalWrite(LED_VERDE, HIGH);
-    digitalWrite(LED_AMARILLO, LOW);
-    digitalWrite(LED_ROJO, LOW);
-  } else if (ica <= 100) {
-    digitalWrite(LED_VERDE, LOW);
-    digitalWrite(LED_AMARILLO, HIGH);
-    digitalWrite(LED_ROJO, LOW);
-  } else {
-    digitalWrite(LED_VERDE, LOW);
-    digitalWrite(LED_AMARILLO, LOW);
-    digitalWrite(LED_ROJO, HIGH);
+  if (ica <= UMBRAL_LED_VERDE_MAX) {          // 0 - 166
+    encenderLedICA(true, false, false);
+  } else if (ica <= UMBRAL_LED_AZUL_MAX) {    // 167 - 334
+    encenderLedICA(false, true, false);
+  } else {                                    // 335 - 500
+    encenderLedICA(false, false, true);
   }
 
   if (millis() - ultimaActualizacionLCD >= INTERVALO_LCD_MS) {
@@ -142,7 +262,7 @@ void actualizarSalidas(int ica, const String& estadoICA) {
 void setup() {
   Serial.begin(115200);
   pinMode(LED_VERDE, OUTPUT);
-  pinMode(LED_AMARILLO, OUTPUT);
+  pinMode(LED_AZUL, OUTPUT);
   pinMode(LED_ROJO, OUTPUT);
   analogSetPinAttenuation(MQ135_PIN, ADC_11db);
 
@@ -173,10 +293,14 @@ void setup() {
   Serial.println(WiFi.softAPIP());
   delay(4000);
 
-  // Calibracion base
-  lecturaBase = leerPromedioSensor(20, 50);
+  // Base automatica despues de detectar que el MQ135 se estabilizo.
+  bool sensorEstable = esperarEstabilizacionSensor();
+  calibracionValida = sensorEstable && calibrarLecturaBase();
   Serial.print("Lectura base: ");
   Serial.println(lecturaBase);
+  Serial.print("Estado calibracion: ");
+  Serial.println(calibracionValida ? "VALIDA" : "INVALIDA");
+  Serial.println(diagnosticoSensor);
 
   lcd.clear();
   lcd.print("IP: ");
@@ -188,6 +312,7 @@ void setup() {
 void loop() {
   // 1. LECTURA Y CALCULO
   int valorADC = leerPromedioSensor(8, 5);
+  int deltaADC = calibracionValida ? max(0, valorADC - lecturaBase) : 0;
   int gasEstimado = convertirRawAGasEstimado(valorADC);
   int icaEstimado = calcularICAEstimado(gasEstimado);
   bool sensorSaturado = lecturaSaturada(valorADC);
@@ -198,11 +323,17 @@ void loop() {
   String recomendacionICA = obtenerRecomendacionICA(icaEstimado);
   int porcentajeICA = calcularPorcentajeICA(icaEstimado);
 
-  if (sensorSaturado) {
+  if (!calibracionValida) {
+    icaEstimado = sensorSaturado ? 500 : 0;
+    estadoICA = sensorSaturado ? "SATURADO" : "CALIB INVALIDA";
+    colorICA = sensorSaturado ? obtenerColorICA(500) : "#64748b";
+    recomendacionICA = diagnosticoSensor;
+  } else if (sensorSaturado) {
     estadoICA = "SATURADO";
-    colorICA = "#6a040f";
+    colorICA = obtenerColorICA(500);
     recomendacionICA = "La salida analogica del sensor esta al limite del ADC. Revisar cableado, voltaje del modulo y tiempo de precalentamiento.";
   }
+  porcentajeICA = calcularPorcentajeICA(icaEstimado);
 
   actualizarSalidas(icaEstimado, estadoICA);
 
@@ -213,6 +344,8 @@ void loop() {
     Serial.print(valorADC);
     Serial.print(" BASE=");
     Serial.print(lecturaBase);
+    Serial.print(" DELTA=");
+    Serial.print(deltaADC);
     Serial.print(" GAS=");
     Serial.print(gasEstimado);
     Serial.print(" ICA=");
@@ -220,21 +353,42 @@ void loop() {
     Serial.print(" WIFI_IP=");
     Serial.print(WiFi.softAPIP());
     Serial.print(" CLIENTES=");
-    Serial.println(WiFi.softAPgetStationNum());
+    Serial.print(WiFi.softAPgetStationNum());
+    Serial.print(" CAL=");
+    Serial.println(calibracionValida ? "OK" : "INVALIDA");
   }
 
   // 3. SERVIDOR WEB NATIVO
   WiFiClient client = server.available();
   if (client) {
     String currentLine = "";
+    String requestLine = "";
     while (client.connected()) {
       if (client.available()) {
         char c = client.read();
         if (c == '\n') {
           if (currentLine.length() == 0) {
+            if (requestLine.startsWith("GET /data")) {
+              client.println("HTTP/1.1 200 OK");
+              client.println("Content-type:application/json");
+              client.println("Connection: close");
+              client.println();
+              client.println("{");
+              client.println("\"ica\":" + String(icaEstimado) + ",");
+              client.println("\"raw\":" + String(valorADC) + ",");
+              client.println("\"base\":" + String(lecturaBase) + ",");
+              client.println("\"delta\":" + String(deltaADC) + ",");
+              client.println("\"gas\":" + String(gasEstimado) + ",");
+              client.println("\"porcentaje\":" + String(porcentajeICA) + ",");
+              client.println("\"estado\":\"" + estadoICA + "\",");
+              client.println("\"color\":\"" + colorICA + "\",");
+              client.println("\"recomendacion\":\"" + recomendacionICA + "\"");
+              client.println("}");
+              break;
+            }
+
             client.println("HTTP/1.1 200 OK");
             client.println("Content-type:text/html");
-            client.println("Refresh: 1"); // <-- CAMBIADO DE 3 A 1
             client.println();
 
             client.println("<html><head><meta charset='UTF-8'>");
@@ -319,10 +473,10 @@ void loop() {
             client.println("<div class='hero-note'>Actualizacion automatica cada 1 segundo sobre la red WiFi propia del dispositivo.</div>");
             client.println("</article>");
             client.println("<aside class='status-panel'>");
-            client.println("<div class='status-top'><div><div class='status-label'>Indice ICA estimado</div></div><div class='status-badge'><span class='dot'></span>" + estadoICA + "</div></div>");
-            client.println("<div class='status-value'>" + String(icaEstimado) + "</div>");
+            client.println("<div class='status-top'><div><div class='status-label'>Indice ICA estimado</div></div><div class='status-badge' id='estadoBadge'><span class='dot'></span>" + estadoICA + "</div></div>");
+            client.println("<div class='status-value' id='icaValor'>" + String(icaEstimado) + "</div>");
             client.println("<div class='status-unit'>Escala de evaluacion: 0 a 500</div>");
-            client.println("<div class='meter'><div class='meter-fill'></div></div>");
+            client.println("<div class='meter'><div class='meter-fill' id='meterFill'></div></div>");
             client.println("<div class='meter-row'><span>0 saludable</span><span>500 critico</span></div>");
             client.println("</aside>");
             client.println("</section>");
@@ -330,12 +484,14 @@ void loop() {
             client.println("<article class='section'>");
             client.println("<h2>Resumen operativo</h2>");
             client.println("<div class='kpi-grid'>");
-            client.println("<div class='kpi'><span>Lectura RAW</span><strong>" + String(valorADC) + "</strong><small>Valor directo entregado por el ADC antes de la normalizacion.</small></div>");
-            client.println("<div class='kpi'><span>Gas estimado</span><strong>" + String(gasEstimado) + "</strong><small>Conversion estimada a partir de la referencia base del sensor.</small></div>");
-            client.println("<div class='kpi'><span>Estado actual</span><strong>" + estadoICA + "</strong><small>Clasificacion del riesgo segun el ICA estimado.</small></div>");
+            client.println("<div class='kpi'><span>Lectura RAW</span><strong id='rawValor'>" + String(valorADC) + "</strong><small>Valor directo entregado por el ADC antes de la normalizacion.</small></div>");
+            client.println("<div class='kpi'><span>Lectura base</span><strong id='baseValor'>" + String(lecturaBase) + "</strong><small>Referencia tomada cuando el MQ135 se detecto estable.</small></div>");
+            client.println("<div class='kpi'><span>Delta RAW</span><strong id='deltaValor'>" + String(deltaADC) + "</strong><small>Aumento real usado para evitar saltos causados por una base alta.</small></div>");
+            client.println("<div class='kpi'><span>Gas estimado</span><strong id='gasValor'>" + String(gasEstimado) + "</strong><small>Conversion estimada a partir de la referencia base del sensor.</small></div>");
+            client.println("<div class='kpi'><span>Estado actual</span><strong id='estadoValor'>" + estadoICA + "</strong><small>Clasificacion del riesgo segun el ICA estimado.</small></div>");
             client.println("<div class='kpi'><span>Red activa</span><strong>Online</strong><small>Punto de acceso local listo para consulta desde celulares o portatiles.</small></div>");
             client.println("</div>");
-            client.println("<div class='recommendation'><strong>Recomendacion inmediata</strong>" + recomendacionICA + "</div>");
+            client.println("<div class='recommendation'><strong>Recomendacion inmediata</strong><span id='recomendacionValor'>" + recomendacionICA + "</span></div>");
             client.println("</article>");
             client.println("<aside class='chart-panel'>");
             client.println("<h2>Tendencia visual</h2>");
@@ -344,7 +500,7 @@ void loop() {
             client.println("<div class='bar' style='height:28%;'><span>Base</span></div>");
             client.println("<div class='bar' style='height:44%;'><span>Seguro</span></div>");
             client.println("<div class='bar' style='height:62%;'><span>Vigilancia</span></div>");
-            client.println("<div class='bar current' style='height:" + String(max(18, porcentajeICA)) + "%;'><span>Actual</span></div>");
+            client.println("<div class='bar current' id='barraActual' style='height:" + String(max(18, porcentajeICA)) + "%;'><span>Actual</span></div>");
             client.println("</div></div>");
             client.println("</aside>");
             client.println("</section>");
@@ -352,10 +508,9 @@ void loop() {
             client.println("<article class='section legend-panel' id='riesgo'>");
             client.println("<h2>Niveles de riesgo</h2>");
             client.println("<div class='legend-list'>");
-            client.println("<div class='legend-item'><strong>Buena</strong><span class='legend-chip' style='background:#2dc653;'>0 - 50</span></div>");
-            client.println("<div class='legend-item'><strong>Moderada</strong><span class='legend-chip' style='background:#f4b400;'>51 - 100</span></div>");
-            client.println("<div class='legend-item'><strong>Sensible</strong><span class='legend-chip' style='background:#fb8500;'>101 - 150</span></div>");
-            client.println("<div class='legend-item'><strong>Danina o peor</strong><span class='legend-chip' style='background:#e63946;'>151 - 500</span></div>");
+            client.println("<div class='legend-item'><strong>Verde</strong><span class='legend-chip' style='background:#2dc653;'>0 - 166</span></div>");
+            client.println("<div class='legend-item'><strong>Azul</strong><span class='legend-chip' style='background:#0284c7;'>167 - 334</span></div>");
+            client.println("<div class='legend-item'><strong>Rojo</strong><span class='legend-chip' style='background:#e63946;'>335 - 500</span></div>");
             client.println("</div>");
             client.println("</article>");
             client.println("<article class='section info-panel' id='sistema'>");
@@ -364,6 +519,10 @@ void loop() {
             client.println("<div class='meta-item'><span>IP del ESP32</span><strong>" + WiFi.softAPIP().toString() + "</strong></div>");
             client.println("<div class='meta-item'><span>SSID</span><strong>" + String(ssid) + "</strong></div>");
             client.println("<div class='meta-item'><span>Formula base</span><strong>ICA por interpolacion lineal</strong></div>");
+            client.println("<div class='meta-item'><span>Metodo de base</span><strong>Estabilidad automatica por delta RAW</strong></div>");
+            client.println("<div class='meta-item'><span>Criterio estable</span><strong>Delta <= " + String(DELTA_ESTABLE_MAX) + " por " + String(LECTURAS_ESTABLES_NECESARIAS) + " lecturas</strong></div>");
+            client.println("<div class='meta-item'><span>Guia de calibracion</span><strong>Min " + minutosRedondeados(PRECALENTAMIENTO_MINIMO_MS) + " / Recom " + minutosRedondeados(PRECALENTAMIENTO_RECOMENDADO_MS) + " / Ideal " + minutosRedondeados(PRECALENTAMIENTO_IDEAL_MS) + "</strong></div>");
+            client.println("<div class='meta-item'><span>Diagnostico sensor</span><strong>" + diagnosticoSensor + "</strong></div>");
             client.println("<div class='meta-item'><span>Intervalo web</span><strong>1 s</strong></div>"); // <-- CAMBIADO DE 3 s A 1 s
             client.println("<div class='meta-item'><span>Clientes conectados</span><strong>" + String(WiFi.softAPgetStationNum()) + "</strong></div>");
             client.println("</div>");
@@ -378,10 +537,18 @@ void loop() {
             client.println("</div>");
             client.println("</section>");
             client.println("<div class='footer'><div>Formula usada: ICA=((Ihi-Ilo)/(BPhi-BPlo))*(Cp-BPlo)+Ilo</div><div>Si el celular dice sin internet, mantenerse conectado y abrir http://192.168.4.1</div></div>");
+            client.println("<script>");
+            client.println("function setText(id,value){const el=document.getElementById(id);if(el)el.textContent=value;}");
+            client.println("async function actualizarDatos(){try{const r=await fetch('/data',{cache:'no-store'});const d=await r.json();document.documentElement.style.setProperty('--accent',d.color);setText('icaValor',d.ica);setText('rawValor',d.raw);setText('baseValor',d.base);setText('deltaValor',d.delta);setText('gasValor',d.gas);setText('estadoValor',d.estado);setText('recomendacionValor',d.recomendacion);const badge=document.getElementById('estadoBadge');if(badge)badge.innerHTML='<span class=\"dot\"></span>'+d.estado;const meter=document.getElementById('meterFill');if(meter)meter.style.width=d.porcentaje+'%';const bar=document.getElementById('barraActual');if(bar)bar.style.height=Math.max(18,d.porcentaje)+'%';}catch(e){}}");
+            client.println("setInterval(actualizarDatos,1000);");
+            client.println("</script>");
             client.println("</main></body></html>");
             client.println();
             break;
           } else {
+            if (requestLine.length() == 0) {
+              requestLine = currentLine;
+            }
             currentLine = "";
           }
         } else if (c != '\r') {
